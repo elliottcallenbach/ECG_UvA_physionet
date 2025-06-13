@@ -1,14 +1,5 @@
 #!/usr/bin/env python
 
-# Edit this script to add your team's code. Some functions are *required*, but you can edit most parts of the required functions,
-# change or remove non-required functions, and add your own functions.
-
-################################################################################
-#
-# Optional libraries, functions, and variables. You can change or remove them.
-#
-################################################################################
-
 import os
 import gc
 import datetime
@@ -18,7 +9,6 @@ from glob import glob
 
 import tensorflow as tf
 import tensorflow.keras as keras
-import keras.backend as K
 from tensorflow.keras.callbacks import Callback
 
 from sklearn.utils.class_weight import compute_class_weight
@@ -26,45 +16,157 @@ from sklearn.model_selection import train_test_split
 
 from helper_code import load_signals
 
-################################################################################
-#
-# Required functions. Edit these functions to add your code, but do not change the arguments for the functions.
-#
-################################################################################
+# ---------------------------
+# Augmentation Functions
+# ---------------------------
+def add_gaussian_noise(signal, mean=0.0, std=0.01):
+    noise = np.random.normal(mean, std, signal.shape)
+    return signal + noise
 
-# Train your models. This function is *required*. You should edit this function to add your code, but do *not* change the arguments
-# of this function. If you do not train one of the models, then you can return None for the model.
+def time_shift(signal, shift_max=50):
+    shift = np.random.randint(-shift_max, shift_max)
+    return np.roll(signal, shift, axis=0)
 
-# Train your model.
-def train_model(data_folder, model_folder, verbose):
-    # Load all data from data_folder
-    X_all, y_all = load_dataset_from_wfdb(data_folder)
+def amplitude_scale(signal, scale_range=(0.9, 1.1)):
+    scale = np.random.uniform(*scale_range)
+    return signal * scale
 
-    # Train-validation split (e.g., 85/15 split)
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_all, y_all, test_size=0.15, stratify=y_all, random_state=42
+def augment_positive_samples(X, y):
+    X_aug, y_aug = [], []
+    for x, label in zip(X, y):
+        if label == 1:
+            X_aug.append(add_gaussian_noise(x))
+            X_aug.append(time_shift(x))
+            X_aug.append(amplitude_scale(x))
+            y_aug.extend([1, 1, 1])
+    return np.array(X_aug), np.array(y_aug)
+
+# ---------------------------
+# Data Loader
+# ---------------------------
+def load_dataset_from_wfdb(folder, fixed_len=1056):
+    files = sorted(glob(os.path.join(folder, "*.hea")))
+    X, Y = [], []
+
+    for hea_path in files:
+        rec_id = os.path.splitext(os.path.basename(hea_path))[0]
+        dat_path = os.path.join(folder, rec_id + ".dat")
+
+        if not os.path.exists(dat_path):
+            continue
+
+        try:
+            record = wfdb.rdrecord(os.path.join(folder, rec_id))
+            sig = record.p_signal.T
+            if sig.shape[0] != 12 or sig.shape[1] < fixed_len:
+                continue
+            sig = sig[:, :fixed_len]
+
+            label = None
+            with open(hea_path) as f:
+                for line in f:
+                    if "Chagas label:" in line:
+                        label = 1 if "True" in line else 0
+                        break
+            if label is None:
+                continue
+
+            X.append(sig.T)
+            Y.append(label)
+
+        except:
+            continue
+
+    return np.array(X), np.array(Y)
+
+# ---------------------------
+# ResNet Model
+# ---------------------------
+def resnet(training_log_path: str, classes: int, init_lr: float, tensorboard_dir: str, n_feature_maps: int = 64):
+    class CustomCallback(Callback):
+        def __init__(self):
+            self.dat = []
+            self.epoch = 1
+        def on_epoch_end(self, batch, logs=None):
+            np.save(f"epoch_dat_{self.epoch}.npy", self.dat, allow_pickle=True)
+            self.epoch += 1
+            gc.collect()
+
+    METRICS = [
+        keras.metrics.BinaryAccuracy(name='accuracy'),
+        keras.metrics.Precision(name='precision'),
+        keras.metrics.Recall(name='recall'),
+        keras.metrics.AUC(name='auc')
+    ]
+
+    input_layer = keras.layers.Input((1056, 12), dtype='float32')
+
+    def residual_block(input_tensor, filters):
+        conv_x = keras.layers.Conv1D(filters, 8, padding='same')(input_tensor)
+        conv_x = keras.layers.BatchNormalization()(conv_x)
+        conv_x = keras.layers.Activation('relu')(conv_x)
+
+        conv_y = keras.layers.Conv1D(filters, 5, padding='same')(conv_x)
+        conv_y = keras.layers.BatchNormalization()(conv_y)
+        conv_y = keras.layers.Activation('relu')(conv_y)
+
+        conv_z = keras.layers.Conv1D(filters, 3, padding='same')(conv_y)
+        conv_z = keras.layers.BatchNormalization()(conv_z)
+
+        shortcut = keras.layers.Conv1D(filters, 1, padding='same')(input_tensor)
+        shortcut = keras.layers.BatchNormalization()(shortcut)
+
+        output = keras.layers.Activation('relu')(keras.layers.add([shortcut, conv_z]))
+        return output
+
+    block1 = residual_block(input_layer, n_feature_maps)
+    block2 = residual_block(block1, n_feature_maps * 2)
+    block3 = residual_block(block2, n_feature_maps * 2)
+
+    gap = keras.layers.GlobalAveragePooling1D()(block3)
+    output_layer = keras.layers.Dense(1, activation='sigmoid')(gap)
+
+    model = keras.models.Model(inputs=input_layer, outputs=output_layer)
+    model.compile(
+        loss='binary_crossentropy',
+        optimizer=keras.optimizers.SGD(learning_rate=init_lr),
+        metrics=METRICS,
+        weighted_metrics=["accuracy"]
     )
 
-    # Augment positive-class examples in training set
+    file_path = f'resnet_model_{str(datetime.datetime.now())}.hdf5'
+    callbacks = [
+        keras.callbacks.ReduceLROnPlateau(monitor='loss', factor=0.5, patience=4, min_lr=1e-7),
+        keras.callbacks.ModelCheckpoint(filepath=file_path, monitor='val_loss', save_best_only=True),
+        keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, min_delta=1e-4),
+        CustomCallback(),
+        keras.callbacks.CSVLogger(training_log_path, separator=",", append=False),
+        keras.callbacks.TensorBoard(f"{tensorboard_dir}/model_{str(datetime.datetime.now())}", histogram_freq=1)
+    ]
+
+    return model, callbacks
+
+# ---------------------------
+# Training function
+# ---------------------------
+def train_model(data_folder, model_folder, verbose):
+    X_all, y_all = load_dataset_from_wfdb(data_folder)
+    X_train, X_val, y_train, y_val = train_test_split(X_all, y_all, test_size=0.15, stratify=y_all, random_state=42)
+
     X_aug, y_aug = augment_positive_samples(X_train, y_train)
     X_train = np.concatenate([X_train, X_aug])
     y_train = np.concatenate([y_train, y_aug])
 
-    # Compute class weights
-    class_weights_array = compute_class_weight(
-        class_weight='balanced',
-        classes=np.array([0, 1]),
-        y=y_train.astype(int)
-    )
+    class_weights_array = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train.astype(int))
     class_weights = {0: class_weights_array[0], 1: class_weights_array[1]}
 
-    # Train model
     model, callbacks = resnet(
         training_log_path=os.path.join(model_folder, "training.log"),
         classes=1,
         init_lr=0.1,
         tensorboard_dir=model_folder
     )
+
     model.fit(
         x=X_train,
         y=y_train.astype(np.float32),
@@ -76,27 +178,25 @@ def train_model(data_folder, model_folder, verbose):
         class_weight=class_weights
     )
 
-    # Save trained model
     os.makedirs(model_folder, exist_ok=True)
     model.save(os.path.join(model_folder, "final_model.hdf5"))
 
     if verbose:
         print("Model trained and saved to", os.path.join(model_folder, "final_model.hdf5"))
 
-
-# Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function. If you do not train one of the models, then you can return None for the model.
+# ---------------------------
+# Load function
+# ---------------------------
 def load_model(model_folder, verbose):
     model_path = os.path.join(model_folder, "final_model.hdf5")
     model = keras.models.load_model(model_path)
     return {"model": model}
 
-# Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function.
+# ---------------------------
+# Run function
+# ---------------------------
 def run_model(record, model, verbose):
     signal, fields = load_signals(record)
-
-    # Pad or truncate signal to 1056 samples
     if signal.shape[1] < 1056:
         padded = np.zeros((signal.shape[0], 1056))
         padded[:, :signal.shape[1]] = signal
@@ -104,13 +204,10 @@ def run_model(record, model, verbose):
     else:
         signal = signal[:, :1056]
 
-    # Format: (1, 1056, 12)
     signal = signal.T.astype(np.float32)
     signal = np.expand_dims(signal, axis=0)
 
-    # Predict
     model = model["model"]
     y_prob = model.predict(signal)[0][0]
     y_pred = int(y_prob >= 0.6)
-
     return y_pred, float(y_prob)
